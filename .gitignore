@@ -1,0 +1,30 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+
+# Audio and recordings
+*.wav
+*.pcm
+*.mp3
+*.m4a
+
+# OS and editor files
+.DS_Store
+.vscode/
+.idea/
