@@ -50,6 +50,7 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 _E164_PHONE_NUMBER = re.compile(r"\+[1-9][0-9]{0,14}\Z")
+_ANONYMOUS_CALLER_ID = "anonymous"
 _HANDOFF_MAX_AGE_SECONDS = 300
 _HANDOFF_FUTURE_SKEW_SECONDS = 30
 _HANDOFF_REPLAY_CACHE: dict[str, int] = {}
@@ -84,6 +85,12 @@ def _validate_twilio_signature(
 
 def _is_e164_phone_number(value: object) -> bool:
     return isinstance(value, str) and _E164_PHONE_NUMBER.fullmatch(value) is not None
+
+
+def _normalize_caller_number(value: object) -> tuple[str, str | None]:
+    if _is_e164_phone_number(value):
+        return value, value
+    return _ANONYMOUS_CALLER_ID, None
 
 
 def _escape_xml_attribute(value: str) -> str:
@@ -140,7 +147,10 @@ def _consume_call_handoff(
     now: int | None = None,
 ) -> bool:
     if (
-        not _is_e164_phone_number(caller_number)
+        not (
+            _is_e164_phone_number(caller_number)
+            or caller_number == _ANONYMOUS_CALLER_ID
+        )
         or not _is_e164_phone_number(called_number)
         or not isinstance(call_sid, str)
         or not call_sid
@@ -434,12 +444,13 @@ async def twilio_voice(request: Request):
         logger.warning("Rejected Twilio voice request: invalid signature")
         raise HTTPException(status_code=403, detail="Invalid Twilio signature")
 
-    caller_number = request_params.get("From")
+    caller_number, caller_phone = _normalize_caller_number(
+        request_params.get("From")
+    )
     called_number = request_params.get("To")
     call_sid = request_params.get("CallSid")
     if (
-        not _is_e164_phone_number(caller_number)
-        or not _is_e164_phone_number(called_number)
+        not _is_e164_phone_number(called_number)
         or not isinstance(call_sid, str)
         or not call_sid
     ):
@@ -716,7 +727,9 @@ async def twilio_media_stream(websocket: WebSocket):
                 call_data = {
                     "realtor_id": realtor_id,
                     "property_id": property_id,
-                    "caller_phone": caller_number,
+                    "caller_phone": (
+                        caller_number if caller_number != _ANONYMOUS_CALLER_ID else None
+                    ),
                     "stream_sid": stream_sid,
                     "started_at": call_started_at.isoformat(),
                     "status": "ringing",

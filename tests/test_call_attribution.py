@@ -379,6 +379,75 @@ class TwilioWebhookTests(unittest.TestCase):
         self.assertIn('name="HandoffSignature" value="', response.text)
         self.assertIn('name="Timestamp" value="', response.text)
 
+    def test_withheld_caller_ids_use_the_anonymous_handoff_value(self):
+        client = TestClient(app_module.app, base_url="https://testserver")
+        for caller_id in ("anonymous", "private", "unknown", ""):
+            with self.subTest(caller_id=caller_id):
+                with (
+                    patch.object(main, "_validate_twilio_signature", return_value=True),
+                    patch.dict(
+                        "os.environ",
+                        {
+                            "PUBLIC_BASE_URL": "https://voice.example.test",
+                            "TWILIO_AUTH_TOKEN": "unit-test-handoff-token",
+                        },
+                    ),
+                ):
+                    response = client.post(
+                        "/twilio/voice",
+                        data={
+                            "From": caller_id,
+                            "To": CALLED_NUMBER,
+                            "CallSid": "CA-call",
+                        },
+                        headers={"X-Twilio-Signature": "valid"},
+                    )
+                    timestamp = response.text.split(
+                        'name="Timestamp" value="'
+                    )[1].split('"')[0]
+                    expected_signature = main._sign_call_handoff(
+                        "anonymous",
+                        CALLED_NUMBER,
+                        "CA-call",
+                        timestamp,
+                    )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('name="From" value="anonymous"', response.text)
+            self.assertIn(
+                f'name="HandoffSignature" value="{expected_signature}"',
+                response.text,
+            )
+
+    def test_missing_or_invalid_called_number_is_rejected(self):
+        client = TestClient(app_module.app, base_url="https://testserver")
+        for call_data in (
+            {"From": "anonymous", "CallSid": "CA-call"},
+            {"From": "anonymous", "To": "not-a-number", "CallSid": "CA-call"},
+        ):
+            with self.subTest(call_data=call_data):
+                with (
+                    patch.object(main, "_validate_twilio_signature", return_value=True),
+                    patch.dict(
+                        "os.environ",
+                        {
+                            "PUBLIC_BASE_URL": "https://voice.example.test",
+                            "TWILIO_AUTH_TOKEN": "unit-test-handoff-token",
+                        },
+                    ),
+                ):
+                    response = client.post(
+                        "/twilio/voice",
+                        data=call_data,
+                        headers={"X-Twilio-Signature": "valid"},
+                    )
+
+                self.assertEqual(response.status_code, 400)
+                self.assertEqual(
+                    response.json()["detail"],
+                    "Invalid phone-number context",
+                )
+
 
 class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -469,6 +538,18 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("12 Main Street", system_prompt.await_args.args[2])
         self.assertTrue(websocket.accepted)
 
+    async def test_anonymous_caller_is_persisted_as_null_and_starts_nova(self):
+        parameters = signed_parameters(caller_number="anonymous")
+        websocket, create_call, nova_stream, _, _ = await self.run_stream(
+            [phone_record()],
+            property_context(),
+            custom_parameters=parameters,
+        )
+
+        self.assertIsNone(create_call.call_args.args[0]["caller_phone"])
+        nova_stream.assert_awaited_once()
+        self.assertTrue(websocket.accepted)
+
     async def test_unknown_number_is_rejected_before_nova(self):
         websocket, create_call, nova_stream, _, property_reader = (
             await self.run_stream([], None)
@@ -530,6 +611,22 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_handoff_signature_is_rejected(self):
         parameters = signed_parameters()
         parameters["HandoffSignature"] = "0" * 64
+        websocket, create_call, nova_stream, _, property_reader = (
+            await self.run_stream(
+                [phone_record()],
+                property_context(),
+                custom_parameters=parameters,
+            )
+        )
+
+        self.assertEqual(websocket.close_codes, [1008])
+        property_reader.assert_not_called()
+        create_call.assert_not_called()
+        nova_stream.assert_not_awaited()
+
+    async def test_tampered_handoff_number_is_rejected(self):
+        parameters = signed_parameters(caller_number="anonymous")
+        parameters["To"] = "+14165550102"
         websocket, create_call, nova_stream, _, property_reader = (
             await self.run_stream(
                 [phone_record()],
