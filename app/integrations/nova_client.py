@@ -1,3 +1,5 @@
+"""Nova Sonic streaming integration."""
+
 import asyncio
 import base64
 import json

@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
 
-from app import main, supabase_service
+from app import main as app_module
+from app.api import twilio_webhooks as main
+from app.integrations import supabase_client as supabase_service
 
 
 PROPERTY_ID = "property-1"
@@ -333,7 +335,7 @@ class PropertyContextTests(unittest.TestCase):
 
 class TwilioWebhookTests(unittest.TestCase):
     def test_invalid_signature_is_rejected(self):
-        client = TestClient(main.app, base_url="https://testserver")
+        client = TestClient(app_module.app, base_url="https://testserver")
         with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": "unit-test-auth-token"}):
             response = client.post(
                 "/twilio/voice",
@@ -349,7 +351,7 @@ class TwilioWebhookTests(unittest.TestCase):
         self.assertEqual(response.json()["detail"], "Invalid Twilio signature")
 
     def test_validated_numbers_are_handed_to_stream_as_custom_parameters(self):
-        client = TestClient(main.app, base_url="https://testserver")
+        client = TestClient(app_module.app, base_url="https://testserver")
         with (
             patch.object(main, "_validate_twilio_signature", return_value=True),
             patch.dict(
