@@ -1,4 +1,4 @@
-"""Backend-only Supabase client and minimal property read service."""
+"""Backend-only Supabase client and persistence operations."""
 
 import logging
 import os
