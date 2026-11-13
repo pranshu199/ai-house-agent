@@ -23,46 +23,140 @@ REGION = "us-east-1"
 SAMPLE_RATE = 24000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
+_CRT_WRITER_TASK_ATTRIBUTE = "_nova_crt_writer_task"
+_CRT_WRITER_READY_ATTRIBUTE = "_nova_crt_writer_ready"
+_CRT_WRITER_LOCK_ATTRIBUTE = "_nova_crt_writer_cleanup_lock"
+_CRT_WRITER_CLEANUP_ERROR_ATTRIBUTE = "_nova_crt_writer_cleanup_error"
+_CRT_WRITER_START_TIMEOUT_SECONDS = 3
+_CRT_WRITER_WAIT_TIMEOUT_SECONDS = 10
 
 
-def _track_crt_request_writer_tasks(stream):
-    """Keep references to the CRT request-body writer tasks for this stream."""
+class NovaWriterCleanupError(RuntimeError):
+    """Raised when the CRT input writer cannot be tracked or stopped safely."""
 
-    writer_tasks = getattr(stream, "_nova_crt_writer_tasks", None)
-    if writer_tasks is None:
-        writer_tasks = set()
-        stream._nova_crt_writer_tasks = writer_tasks
 
-    current_task = asyncio.current_task()
-    for task in asyncio.all_tasks():
-        if task is current_task:
-            continue
+class _NovaCRTHTTPClient(AWSCRTHTTPClient):
+    async def _create_body_generator(self, body):
+        writer_task = asyncio.current_task()
+        if writer_task is not None:
+            _associate_crt_writer_task(body, writer_task)
 
-        coroutine = task.get_coro()
-        if getattr(coroutine, "__qualname__", "").endswith(
-            "AIOHttp2ClientStream._set_request_body_generator"
-        ):
-            writer_tasks.add(task)
+        async for chunk in super()._create_body_generator(body):
+            yield chunk
+
+
+def _associate_crt_writer_task(body, task) -> None:
+    existing_task = getattr(body, _CRT_WRITER_TASK_ATTRIBUTE, None)
+    if existing_task is not None and existing_task is not task:
+        raise NovaWriterCleanupError(
+            "Multiple CRT writer tasks were associated with one Nova input body"
+        )
+
+    setattr(body, _CRT_WRITER_TASK_ATTRIBUTE, task)
+    ready = getattr(body, _CRT_WRITER_READY_ATTRIBUTE, None)
+    if ready is not None:
+        ready.set()
+
+
+def _prepare_crt_writer_tracking(stream):
+    """Prepare tracking on the exact body held by this duplex input publisher."""
+
+    input_stream = getattr(stream, "input_stream", None)
+    input_body = getattr(input_stream, "_writer", None)
+    if input_body is None:
+        raise NovaWriterCleanupError(
+            "Nova input publisher does not expose its request body for CRT tracking"
+        )
+
+    if getattr(input_body, _CRT_WRITER_READY_ATTRIBUTE, None) is None:
+        setattr(input_body, _CRT_WRITER_READY_ATTRIBUTE, asyncio.Event())
+    if getattr(input_body, _CRT_WRITER_LOCK_ATTRIBUTE, None) is None:
+        setattr(input_body, _CRT_WRITER_LOCK_ATTRIBUTE, asyncio.Lock())
+
+    if getattr(input_body, _CRT_WRITER_TASK_ATTRIBUTE, None) is not None:
+        getattr(input_body, _CRT_WRITER_READY_ATTRIBUTE).set()
+    return input_body
+
+
+def _consume_task_result(task) -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def _await_crt_writer_task(input_body) -> None:
+    ready = getattr(input_body, _CRT_WRITER_READY_ATTRIBUTE)
+    try:
+        await asyncio.wait_for(
+            ready.wait(),
+            timeout=_CRT_WRITER_START_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise NovaWriterCleanupError(
+            "Timed out waiting for the Nova CRT writer task to start"
+        ) from exc
+
+    writer_task = getattr(input_body, _CRT_WRITER_TASK_ATTRIBUTE, None)
+    if writer_task is None:
+        raise NovaWriterCleanupError(
+            "Nova CRT writer task startup signal arrived without a task"
+        )
+    if writer_task is asyncio.current_task():
+        raise NovaWriterCleanupError("Nova CRT writer cannot await itself")
+
+    done, _ = await asyncio.wait(
+        {writer_task},
+        timeout=_CRT_WRITER_WAIT_TIMEOUT_SECONDS,
+    )
+    if not done:
+        writer_task.add_done_callback(_consume_task_result)
+        raise NovaWriterCleanupError(
+            "Timed out waiting for the Nova CRT writer task to stop"
+        )
+
+    writer_task.result()
 
 
 async def _close_input_stream_and_wait(stream):
     """Half-close Nova input and retrieve its CRT writer task result."""
 
-    _track_crt_request_writer_tasks(stream)
-
+    input_body = _prepare_crt_writer_tracking(stream)
     input_stream = stream.input_stream
-    if not getattr(input_stream, "closed", False):
-        await input_stream.close()
+    cleanup_lock = getattr(input_body, _CRT_WRITER_LOCK_ATTRIBUTE)
+    async with cleanup_lock:
+        previous_error = getattr(
+            input_body,
+            _CRT_WRITER_CLEANUP_ERROR_ATTRIBUTE,
+            None,
+        )
+        if previous_error is not None:
+            raise previous_error
 
-    writer_tasks = getattr(stream, "_nova_crt_writer_tasks", set())
-    if writer_tasks:
-        tasks = tuple(writer_tasks)
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        writer_tasks.difference_update(tasks)
+        close_error = None
+        try:
+            if not getattr(input_stream, "closed", False):
+                close_task = asyncio.create_task(input_stream.close())
+                try:
+                    close_done, _ = await asyncio.wait(
+                        {close_task},
+                        timeout=_CRT_WRITER_WAIT_TIMEOUT_SECONDS,
+                    )
+                except BaseException:
+                    close_task.add_done_callback(_consume_task_result)
+                    raise
+                if close_done:
+                    close_task.result()
+                else:
+                    close_task.add_done_callback(_consume_task_result)
+                    close_error = NovaWriterCleanupError(
+                        "Timed out closing the Nova input publisher"
+                    )
 
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+            await _await_crt_writer_task(input_body)
+            if close_error is not None:
+                raise close_error
+        except BaseException as exc:
+            setattr(input_body, _CRT_WRITER_CLEANUP_ERROR_ATTRIBUTE, exc)
+            raise
 
 
 async def send_event(stream, event):
@@ -77,7 +171,7 @@ async def send_event(stream, event):
             )
         )
     )
-    _track_crt_request_writer_tasks(stream)
+    _prepare_crt_writer_tracking(stream)
 
 
 async def create_nova_stream():
@@ -90,7 +184,7 @@ async def create_nova_stream():
 
     print("NOVA DEBUG 1: starting config resolve", flush=True)
 
-    http_client = AWSCRTHTTPClient()
+    http_client = _NovaCRTHTTPClient()
 
     credential_resolver = IMDSCredentialsResolver(
         http_client=http_client
@@ -115,6 +209,7 @@ async def create_nova_stream():
             model_id=MODEL_ID
         )
     )
+    _prepare_crt_writer_tracking(stream)
 
     print("NOVA DEBUG 4: stream created", flush=True)
 
@@ -398,23 +493,24 @@ async def receive_events(stream):
 async def close_nova(client, stream):
     """Cleanly close the Nova stream and client."""
 
-    cleanup_error = None
+    cleanup_error: BaseException | None = None
 
     try:
         await _close_input_stream_and_wait(stream)
-    except Exception as exc:
+    except BaseException as exc:
         cleanup_error = exc
 
     try:
         output_stream = getattr(stream, "output_stream", None)
         if output_stream is not None:
             await output_stream.close()
-    except Exception:
-        pass
+    except BaseException as exc:
+        if cleanup_error is None:
+            cleanup_error = exc
 
     try:
         await client.close()
-    except Exception as exc:
+    except BaseException as exc:
         if cleanup_error is None:
             cleanup_error = exc
 
