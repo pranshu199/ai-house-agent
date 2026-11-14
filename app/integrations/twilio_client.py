@@ -103,13 +103,11 @@ def find_provisioned_canadian_number(phone_number: str, request_id: str):
 
     matches = get_twilio_client().incoming_phone_numbers.list(
         phone_number=phone_number,
-        friendly_name=_provisioning_friendly_name(request_id),
         limit=20,
     )
     for number in matches:
         if (
             getattr(number, "phone_number", None) == phone_number
-            and getattr(number, "iso_country", None) == "CA"
             and getattr(number, "friendly_name", None)
             == _provisioning_friendly_name(request_id)
         ):

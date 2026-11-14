@@ -328,7 +328,6 @@ def purchase_phone_number(
 
     returned_number = getattr(purchased_number, "phone_number", None)
     twilio_sid = getattr(purchased_number, "sid", None)
-    country_code = getattr(purchased_number, "iso_country", None)
     if returned_number != request.phone_number or not twilio_sid:
         raise HTTPException(
             status_code=502,
@@ -339,7 +338,9 @@ def purchase_phone_number(
         service.record_purchase_result,
         principal=principal,
         request_id=request_id,
-        country_code=country_code,
+        # purchase_canadian_local_number validates the exact number against
+        # Canada's voice-capable inventory before creating it.
+        country_code="CA",
         phone_number=returned_number,
         twilio_sid=twilio_sid,
     )
@@ -393,7 +394,10 @@ def reconcile_phone_number_purchase(
             service.record_purchase_result,
             principal=principal,
             request_id=request_id,
-            country_code=getattr(purchased_number, "iso_country", None),
+            # The incoming-number SDK resource has no iso_country field. This
+            # exact number was validated against Canada's available inventory
+            # before the purchase attempt that is now being reconciled.
+            country_code="CA",
             phone_number=getattr(purchased_number, "phone_number", None),
             twilio_sid=getattr(purchased_number, "sid", None),
         )

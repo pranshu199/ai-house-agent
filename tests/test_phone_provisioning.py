@@ -482,13 +482,40 @@ class TwilioPhoneNumberAdapterTests(unittest.TestCase):
 
         self.twilio.incoming_phone_numbers.create.assert_not_called()
 
-    def test_reconciliation_requires_request_marker_and_exact_number(self):
+    def test_reconciliation_finds_number_then_checks_request_marker_locally(self):
+        purchased_number = SimpleNamespace(
+            phone_number="+14165550101",
+            friendly_name="AIHA provisioning request-1",
+        )
+
+        def list_numbers(**filters):
+            if "friendly_name" in filters:
+                return []
+            return [purchased_number]
+
+        self.twilio.incoming_phone_numbers.list.side_effect = list_numbers
+        with patch.object(twilio_client, "get_twilio_client", return_value=self.twilio):
+            found = twilio_client.find_provisioned_canadian_number(
+                "+14165550101",
+                "request-1",
+            )
+
+        self.assertIs(found, purchased_number)
+        self.twilio.incoming_phone_numbers.list.assert_called_once_with(
+            phone_number="+14165550101",
+            limit=20,
+        )
+
+    def test_reconciliation_rejects_candidates_without_exact_local_matches(self):
         self.twilio.incoming_phone_numbers.list.return_value = [
             SimpleNamespace(
                 phone_number="+14165550101",
-                iso_country="CA",
+                friendly_name="AIHA provisioning another-request",
+            ),
+            SimpleNamespace(
+                phone_number="+14165550102",
                 friendly_name="AIHA provisioning request-1",
-            )
+            ),
         ]
         with patch.object(twilio_client, "get_twilio_client", return_value=self.twilio):
             found = twilio_client.find_provisioned_canadian_number(
@@ -496,10 +523,9 @@ class TwilioPhoneNumberAdapterTests(unittest.TestCase):
                 "request-1",
             )
 
-        self.assertIsNotNone(found)
+        self.assertIsNone(found)
         self.twilio.incoming_phone_numbers.list.assert_called_once_with(
             phone_number="+14165550101",
-            friendly_name="AIHA provisioning request-1",
             limit=20,
         )
 
@@ -563,7 +589,6 @@ class PhoneNumberProvisioningAPITests(unittest.TestCase):
         request = self.create_request()
         purchased_number = SimpleNamespace(
             phone_number="+14165550101",
-            iso_country="CA",
             sid=f"PN{'a' * 32}",
         )
         with (
@@ -659,7 +684,6 @@ class PhoneNumberProvisioningAPITests(unittest.TestCase):
         request = self.create_request()
         purchased_number = SimpleNamespace(
             phone_number="+14165550101",
-            iso_country="CA",
             sid=f"PN{'b' * 32}",
         )
         with (
