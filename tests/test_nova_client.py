@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -467,8 +468,109 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
                 await nova_client.generate_call_summary(
                     [{"role": "USER", "text": "Tell me about the house."}]
                 )
-
         client.close.assert_awaited_once()
+        http_client.close.assert_not_awaited()
+
+    async def _extract_lead_response(self, response_text):
+        response = type(
+            "ConverseResponse",
+            (),
+            {
+                "output": ConverseOutputMessage(
+                    value=Message(
+                        role=ConversationRole.ASSISTANT,
+                        content=[ContentBlockText(value=response_text)],
+                    )
+                )
+            },
+        )()
+        http_client = AsyncMock()
+        client = AsyncMock()
+        client.converse.return_value = response
+        with (
+            patch.object(nova_client, "AWSCRTHTTPClient", return_value=http_client),
+            patch.object(nova_client, "IMDSCredentialsResolver", return_value=object()),
+            patch.object(
+                nova_client.AsyncBedrockRuntimeConfig,
+                "resolve",
+                new_callable=AsyncMock,
+                return_value=object(),
+            ) as resolve_config,
+            patch.object(nova_client, "AsyncBedrockRuntimeClient", return_value=client),
+        ):
+            result = await nova_client.extract_call_lead(
+                [{"role": "USER", "text": "Could I view the house?"}]
+            )
+
+        request = client.converse.await_args.args[0]
+        self.assertEqual(request.model_id, "us.amazon.nova-2-lite-v1:0")
+        self.assertEqual(resolve_config.await_args.kwargs["region"], "us-east-1")
+        self.assertIn("only use user messages", request.system[0].value.lower())
+        client.close.assert_awaited_once()
+        return result
+
+    async def test_extract_call_lead_returns_valid_structured_data(self):
+        extraction = await self._extract_lead_response(
+            json.dumps(
+                {
+                    "name": "Sam",
+                    "email": "sam@example.test",
+                    "lead_type": "buyer",
+                    "intent": "viewing_request",
+                    "budget_min": 500000,
+                    "budget_max": 650000,
+                    "timeline": "within 2 weeks",
+                    "interested_property": "12 Main Street",
+                    "summary": "Caller requested a viewing of 12 Main Street.",
+                    "evidence": ["Caller asked to view the house."],
+                }
+            )
+        )
+        self.assertEqual(extraction["name"], "Sam")
+        self.assertEqual(extraction["intent"], "viewing_request")
+        self.assertEqual(extraction["budget_max"], 650000)
+        self.assertEqual(extraction["evidence"], ["Caller asked to view the house."])
+
+    async def test_extract_call_lead_accepts_undisclosed_caller_information(self):
+        extraction = await self._extract_lead_response(
+            json.dumps(
+                {
+                    "name": None,
+                    "email": None,
+                    "lead_type": "unknown",
+                    "intent": "unknown",
+                    "budget_min": None,
+                    "budget_max": None,
+                    "timeline": None,
+                    "interested_property": None,
+                    "summary": "Caller information was not disclosed.",
+                    "evidence": [],
+                }
+            )
+        )
+        self.assertIsNone(extraction["name"])
+        self.assertIsNone(extraction["email"])
+        self.assertEqual(extraction["lead_type"], "unknown")
+
+    async def test_extract_call_lead_rejects_malformed_json(self):
+        with self.assertRaisesRegex(ValueError, "malformed JSON"):
+            await self._extract_lead_response("not json")
+
+    async def test_extract_call_lead_rejects_invalid_fields(self):
+        response = {
+            "name": None,
+            "email": None,
+            "lead_type": "buyer",
+            "intent": "made_up_intent",
+            "budget_min": None,
+            "budget_max": None,
+            "timeline": None,
+            "interested_property": None,
+            "summary": "No caller details.",
+            "evidence": [],
+        }
+        with self.assertRaisesRegex(ValueError, "intent is invalid"):
+            await self._extract_lead_response(json.dumps(response))
 
     @staticmethod
     async def _raise(error):

@@ -46,6 +46,7 @@ from app.integrations.supabase_client import (
     read_property_context,
     read_phone_number_matches,
 )
+from app.services.lead_capture import capture_call_lead
 
 
 router = APIRouter()
@@ -1116,15 +1117,6 @@ async def twilio_media_stream(websocket: WebSocket):
                     )
                     if not isinstance(summary, str) or not summary.strip():
                         raise RuntimeError("Nova summary generation returned no text")
-                    await asyncio.to_thread(
-                        update_call_summary,
-                        call_record_id,
-                        summary.strip(),
-                    )
-                    logger.info(
-                        "CALL_SUMMARY_PERSISTENCE_SUCCESS call_id=%s",
-                        call_record_id,
-                    )
                 except asyncio.TimeoutError:
                     logger.warning(
                         "CALL_SUMMARY_GENERATION_TIMEOUT call_id=%s",
@@ -1138,6 +1130,45 @@ async def twilio_media_stream(websocket: WebSocket):
                         type(exc).__name__,
                         _safe_bedrock_error_message(exc),
                     )
+                else:
+                    try:
+                        await asyncio.to_thread(
+                            update_call_summary,
+                            call_record_id,
+                            summary.strip(),
+                        )
+                        logger.info(
+                            "CALL_SUMMARY_PERSISTENCE_SUCCESS call_id=%s",
+                            call_record_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "CALL_SUMMARY_PERSISTENCE_FAILURE call_id=%s error_type=%s",
+                            call_record_id,
+                            type(exc).__name__,
+                        )
+
+                    try:
+                        lead_id = await asyncio.wait_for(
+                            capture_call_lead(call_record_id, transcript_entries),
+                            timeout=25,
+                        )
+                        logger.info(
+                            "CALL_LEAD_CAPTURE_SUCCESS call_id=%s lead_id=%s",
+                            call_record_id,
+                            lead_id,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "CALL_LEAD_CAPTURE_TIMEOUT call_id=%s",
+                            call_record_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "CALL_LEAD_CAPTURE_FAILURE call_id=%s error_type=%s",
+                            call_record_id,
+                            type(exc).__name__,
+                        )
 
         if websocket_connected:
             try:

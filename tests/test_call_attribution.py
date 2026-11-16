@@ -560,6 +560,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         disconnect_after_start=False,
         summary_error=None,
         summary_update_error=None,
+        lead_capture_error=None,
     ):
         messages = [
             start_message(
@@ -607,6 +608,10 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             side_effect=summary_error if summary_error else None,
             return_value="Caller asked about the property.",
         )
+        lead_capture_mock = AsyncMock(
+            side_effect=lead_capture_error if lead_capture_error else None,
+            return_value="lead-1",
+        )
 
         property_reader = Mock(
             side_effect=context_error if context_error else lambda *_args: context
@@ -625,6 +630,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "finalize_call_record", finalize_call_mock),
             patch.object(main, "update_call_summary", update_summary_mock),
             patch.object(main, "generate_call_summary", summary_mock),
+            patch.object(main, "capture_call_lead", lead_capture_mock),
             patch.object(main, "create_nova_stream", nova_stream_mock),
             patch.object(main, "start_session", start_session_mock),
             patch.object(main, "send_system_prompt", system_prompt_mock),
@@ -638,6 +644,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         self.finalize_call_mock = finalize_call_mock
         self.update_summary_mock = update_summary_mock
         self.summary_mock = summary_mock
+        self.lead_capture_mock = lead_capture_mock
         return websocket, create_call_mock, nova_stream_mock, system_prompt_mock, property_reader
 
     async def test_valid_mapping_persists_ids_and_caller_phone_then_starts_nova(self):
@@ -676,6 +683,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             "call-1",
             "Caller asked about the property.",
         )
+        self.lead_capture_mock.assert_awaited_once_with("call-1", stored_transcript)
 
     async def test_summary_failure_does_not_prevent_transcript_finalization(self):
         await self.run_stream(
@@ -695,6 +703,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             "completed",
         )
         self.update_summary_mock.assert_not_called()
+        self.lead_capture_mock.assert_not_awaited()
 
     async def test_summary_failure_logs_bedrock_message_without_interrupting_finalization(self):
         error = RuntimeError()
@@ -712,6 +721,24 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.finalize_call_mock.assert_called_once()
         self.update_summary_mock.assert_not_called()
+        self.lead_capture_mock.assert_not_awaited()
+
+    async def test_lead_extraction_failure_does_not_interrupt_call_finalization(self):
+        with self.assertLogs(main.logger, level="WARNING") as captured:
+            await self.run_stream(
+                [phone_record()],
+                property_context(),
+                transcript_text="Could I arrange a viewing?",
+                lead_capture_error=ValueError("invalid extraction response"),
+            )
+
+        self.finalize_call_mock.assert_called_once()
+        self.summary_mock.assert_awaited_once()
+        self.update_summary_mock.assert_called_once()
+        self.lead_capture_mock.assert_awaited_once()
+        self.assertTrue(
+            any("CALL_LEAD_CAPTURE_FAILURE" in line for line in captured.output)
+        )
 
     async def test_summary_persistence_failure_does_not_change_completed_call(self):
         await self.run_stream(
@@ -728,6 +755,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.summary_mock.assert_awaited_once()
         self.update_summary_mock.assert_called_once()
+        self.lead_capture_mock.assert_awaited_once()
 
     async def test_unexpected_disconnect_persists_structured_transcript(self):
         websocket, *_ = await self.run_stream(
