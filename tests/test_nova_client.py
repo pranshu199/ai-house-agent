@@ -3,6 +3,12 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 import awscrt.exceptions
+from aws_sdk_bedrock_runtime.models import (
+    ContentBlockText,
+    ConverseOutputMessage,
+    ConversationRole,
+    Message,
+)
 
 from app.integrations import nova_client
 
@@ -385,6 +391,81 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
             "Timed out closing the Nova input publisher",
         )
         stream.output_stream.close.assert_awaited_once()
+        client.close.assert_awaited_once()
+
+    async def test_generate_call_summary_uses_transcript_and_closes_client(self):
+        transcript = [
+            {"role": "USER", "text": "My name is Sam.", "timestamp": "2026-11-15T17:00:00Z"},
+            {"role": "ASSISTANT", "text": "Would you like a viewing?", "timestamp": "2026-11-15T17:00:02Z"},
+        ]
+        response = type(
+            "ConverseResponse",
+            (),
+            {
+                "output": ConverseOutputMessage(
+                    value=Message(
+                        role=ConversationRole.ASSISTANT,
+                        content=[ContentBlockText(value="Caller Sam requested property details.")],
+                    )
+                )
+            },
+        )()
+        http_client = AsyncMock()
+        client = AsyncMock()
+        client.converse.return_value = response
+        config = object()
+
+        with (
+            patch.object(nova_client, "AWSCRTHTTPClient", return_value=http_client),
+            patch.object(nova_client, "IMDSCredentialsResolver", return_value=object()),
+            patch.object(
+                nova_client.AsyncBedrockRuntimeConfig,
+                "resolve",
+                new_callable=AsyncMock,
+                return_value=config,
+            ),
+            patch.object(
+                nova_client,
+                "AsyncBedrockRuntimeClient",
+                return_value=client,
+            ),
+        ):
+            summary = await nova_client.generate_call_summary(transcript)
+
+        self.assertEqual(summary, "Caller Sam requested property details.")
+        client.converse.assert_awaited_once()
+        request = client.converse.await_args.args[0]
+        self.assertEqual(request.model_id, nova_client.SUMMARY_MODEL_ID)
+        self.assertIn("only facts explicitly", request.system[0].value)
+        self.assertIn('"My name is Sam."', request.messages[0].content[0].value)
+        client.close.assert_awaited_once()
+        http_client.close.assert_not_awaited()
+
+    async def test_generate_call_summary_closes_client_after_model_failure(self):
+        http_client = AsyncMock()
+        client = AsyncMock()
+        client.converse.side_effect = RuntimeError("model unavailable")
+
+        with (
+            patch.object(nova_client, "AWSCRTHTTPClient", return_value=http_client),
+            patch.object(nova_client, "IMDSCredentialsResolver", return_value=object()),
+            patch.object(
+                nova_client.AsyncBedrockRuntimeConfig,
+                "resolve",
+                new_callable=AsyncMock,
+                return_value=object(),
+            ),
+            patch.object(
+                nova_client,
+                "AsyncBedrockRuntimeClient",
+                return_value=client,
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+                await nova_client.generate_call_summary(
+                    [{"role": "USER", "text": "Tell me about the house."}]
+                )
+
         client.close.assert_awaited_once()
 
     @staticmethod

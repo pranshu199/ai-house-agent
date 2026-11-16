@@ -28,6 +28,7 @@ from twilio.request_validator import RequestValidator
 
 from app.integrations.nova_client import (
     create_nova_stream,
+    generate_call_summary,
     start_session,
     send_system_prompt,
     send_audio_content_start,
@@ -41,6 +42,7 @@ from app.integrations.nova_client import (
 from app.integrations.supabase_client import (
     create_call_record,
     finalize_call_record,
+    update_call_summary,
     read_property_context,
     read_phone_number_matches,
 )
@@ -274,12 +276,85 @@ def _pcm24_to_mulaw8(
     return output, pending_pcm_bytes, pending_samples
 
 
+class _CallTranscriptBuffer:
+    def __init__(self):
+        self._entries: list[dict[str, str]] = []
+        self._pending_content_ids: dict[str, dict[str, str]] = {}
+        self._seen_content_ids: set[str] = set()
+
+    def start_content(self, content_start: object) -> None:
+        if not isinstance(content_start, Mapping):
+            return
+        content_id = content_start.get("contentId")
+        role = content_start.get("role")
+        if (
+            not isinstance(content_id, str)
+            or content_id in self._seen_content_ids
+            or role not in ("USER", "ASSISTANT")
+            or content_start.get("type") != "TEXT"
+        ):
+            return
+
+        model_fields = content_start.get("additionalModelFields")
+        if isinstance(model_fields, str):
+            try:
+                model_fields = json.loads(model_fields)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Nova transcript content had invalid additionalModelFields"
+                )
+                return
+        if (
+            not isinstance(model_fields, Mapping)
+            or model_fields.get("generationStage") != "FINAL"
+        ):
+            return
+
+        self._seen_content_ids.add(content_id)
+        entry = {
+            "role": role,
+            "text": "",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self._entries.append(entry)
+        self._pending_content_ids[content_id] = entry
+
+    def add_text(self, text_output: object) -> None:
+        if not isinstance(text_output, Mapping):
+            return
+        content_id = text_output.get("contentId")
+        text = text_output.get("content")
+        if not isinstance(content_id, str) or not isinstance(text, str) or not text:
+            return
+
+        entry = self._pending_content_ids.get(content_id)
+        if entry is None:
+            return
+        if entry["role"] == "ASSISTANT":
+            text = re.sub(r'\{\s*"interrupted"\s*:\s*true\s*\}', " ", text)
+        entry["text"] += text
+
+    def end_content(self, content_end: object) -> None:
+        if not isinstance(content_end, Mapping):
+            return
+        content_id = content_end.get("contentId")
+        if isinstance(content_id, str):
+            self._pending_content_ids.pop(content_id, None)
+
+    def entries(self) -> list[dict[str, str]]:
+        return [
+            dict(entry)
+            for entry in self._entries
+            if entry["text"].strip()
+        ]
+
+
 async def _forward_nova_audio_to_twilio(
     stream,
     websocket: WebSocket,
     stream_sid: str,
     session_stopping: asyncio.Event,
-    assistant_text_chunks: list[str],
+    transcript_buffer: _CallTranscriptBuffer,
 ):
     content_roles = {}
     pending_pcm_bytes = b""
@@ -294,8 +369,18 @@ async def _forward_nova_audio_to_twilio(
         if not result.value or not result.value.bytes_:
             continue
 
-        response = json.loads(result.value.bytes_.decode("utf-8"))
+        try:
+            response = json.loads(result.value.bytes_.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning("Nova emitted a malformed event payload")
+            continue
+        if not isinstance(response, Mapping):
+            logger.warning("Nova emitted an event payload that was not an object")
+            continue
         event = response.get("event", {})
+        if not isinstance(event, Mapping):
+            logger.warning("Nova emitted an event without a valid event object")
+            continue
 
         if "userSpeechStart" in event:
             if not interrupted:
@@ -314,37 +399,30 @@ async def _forward_nova_audio_to_twilio(
                 })
         elif "contentStart" in event:
             content_start = event["contentStart"]
-            content_id = content_start.get("contentId")
-            if content_id:
+            transcript_buffer.start_content(content_start)
+            if isinstance(content_start, Mapping):
+                content_id = content_start.get("contentId")
+            else:
+                content_id = None
+            if isinstance(content_id, str):
                 role = content_start.get("role")
                 content_roles[content_id] = role
                 if (
                     interrupted
                     and role == "ASSISTANT"
+                    and content_start.get("type") == "AUDIO"
                     and content_id not in stale_content_ids
                 ):
                     interrupted = False
         elif "textOutput" in event:
-            try:
-                text_output = event["textOutput"]
-                content_id = text_output.get("contentId")
-                text = text_output.get("content", "")
-                text = re.sub(r'\{\s*"interrupted"\s*:\s*true\s*\}', " ", text)
-                if (
-                    isinstance(text, str)
-                    and text
-                    and content_roles.get(content_id) == "ASSISTANT"
-                    and not interrupted
-                    and content_id not in stale_content_ids
-                ):
-                    assistant_text_chunks.append(text)
-            except Exception as exc:
-                logger.warning(
-                    "Nova assistant text capture failed (%s)",
-                    type(exc).__name__,
-                )
+            transcript_buffer.add_text(event["textOutput"])
+        elif "contentEnd" in event:
+            transcript_buffer.end_content(event["contentEnd"])
         elif "audioOutput" in event:
             audio_output = event["audioOutput"]
+            if not isinstance(audio_output, Mapping):
+                logger.warning("Nova emitted malformed audio output metadata")
+                continue
             content_id = audio_output.get("contentId")
             if interrupted or content_id in stale_content_ids:
                 continue
@@ -554,7 +632,7 @@ async def twilio_media_stream(websocket: WebSocket):
     websocket_connected = True
     call_failed = False
     call_record_id = None
-    assistant_text_chunks = []
+    transcript_buffer = _CallTranscriptBuffer()
     call_started_at = None
     call_started_monotonic = None
 
@@ -876,7 +954,7 @@ async def twilio_media_stream(websocket: WebSocket):
                         websocket,
                         stream_sid,
                         session_stopping,
-                        assistant_text_chunks,
+                        transcript_buffer,
                     )
                 )
                 logger.info(
@@ -968,6 +1046,12 @@ async def twilio_media_stream(websocket: WebSocket):
                 if stop_received and not call_failed
                 else "failed"
             )
+            transcript_entries = transcript_buffer.entries()
+            transcript_json = json.dumps(
+                transcript_entries,
+                ensure_ascii=False,
+            )
+            call_finalized = False
             try:
                 logger.info(
                     "CALL_PERSISTENCE_FINALIZE_ATTEMPT call_id=%s terminal_status=%s",
@@ -981,9 +1065,10 @@ async def twilio_media_stream(websocket: WebSocket):
                         "ended_at": call_ended_at.isoformat(),
                         "duration_seconds": duration_seconds,
                         "status": terminal_status,
-                        "transcript": "".join(assistant_text_chunks),
+                        "transcript": transcript_json,
                     },
                 )
+                call_finalized = True
                 logger.info(
                     "CALL_PERSISTENCE_FINALIZE_SUCCESS call_id=%s",
                     call_record_id,
@@ -994,6 +1079,35 @@ async def twilio_media_stream(websocket: WebSocket):
                     type(exc).__name__,
                     _safe_supabase_error(exc),
                 )
+
+            if call_finalized and terminal_status == "completed" and transcript_entries:
+                try:
+                    summary = await asyncio.wait_for(
+                        generate_call_summary(transcript_entries),
+                        timeout=20,
+                    )
+                    if not isinstance(summary, str) or not summary.strip():
+                        raise RuntimeError("Nova summary generation returned no text")
+                    await asyncio.to_thread(
+                        update_call_summary,
+                        call_record_id,
+                        summary.strip(),
+                    )
+                    logger.info(
+                        "CALL_SUMMARY_PERSISTENCE_SUCCESS call_id=%s",
+                        call_record_id,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "CALL_SUMMARY_GENERATION_TIMEOUT call_id=%s",
+                        call_record_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "CALL_SUMMARY_GENERATION_FAILURE call_id=%s error_type=%s",
+                        call_record_id,
+                        type(exc).__name__,
+                    )
 
         if websocket_connected:
             try:

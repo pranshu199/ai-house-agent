@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from app import main as app_module
 from app.api import twilio_webhooks as main
@@ -29,6 +30,7 @@ class FakeQuery:
         self.in_filters = {}
         self.row_limit = None
         self.inserted_data = None
+        self.updated_data = None
 
     def select(self, fields):
         return self
@@ -49,6 +51,10 @@ class FakeQuery:
         self.inserted_data = data
         return self
 
+    def update(self, data):
+        self.updated_data = data
+        return self
+
     def execute(self):
         if self.inserted_data is not None:
             self.client.inserted_rows.append(self.inserted_data)
@@ -61,6 +67,10 @@ class FakeQuery:
             if all(row.get(field) == value for field, value in self.filters.items())
             and all(row.get(field) in values for field, values in self.in_filters.items())
         ]
+        if self.updated_data is not None:
+            for row in rows:
+                row.update(self.updated_data)
+            return FakeResponse([{"id": row["id"]} for row in rows if "id" in row])
         if self.row_limit is not None:
             rows = rows[: self.row_limit]
         return FakeResponse(rows)
@@ -90,6 +100,8 @@ class FakeWebSocket:
         self.accepted = True
 
     async def receive_text(self):
+        if not self.messages:
+            raise WebSocketDisconnect(code=1000)
         return self.messages.pop(0)
 
     async def close(self, code):
@@ -332,6 +344,22 @@ class PropertyContextTests(unittest.TestCase):
 
         self.assertEqual(client.inserted_rows, [call_data])
 
+    def test_summary_update_changes_only_ai_summary(self):
+        call = {
+            "id": "call-1",
+            "transcript": '[{"role":"USER","text":"I like the house."}]',
+            "status": "completed",
+        }
+        client = FakeSupabaseClient({"calls": [call]})
+        with patch.object(supabase_service, "get_supabase_client", return_value=client):
+            supabase_service.update_call_summary("call-1", "Caller likes the house.")
+
+        self.assertEqual(call["ai_summary"], "Caller likes the house.")
+        self.assertEqual(
+            client.queries[0].updated_data,
+            {"ai_summary": "Caller likes the house."},
+        )
+
 
 class TwilioWebhookTests(unittest.TestCase):
     def test_invalid_signature_is_rejected(self):
@@ -464,16 +492,20 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         custom_parameters=None,
         start_call_sid="CA-call",
         websocket_signature_valid=True,
+        transcript_text=None,
+        disconnect_after_start=False,
+        summary_error=None,
+        summary_update_error=None,
     ):
-        websocket = FakeWebSocket(
-            [
-                start_message(
-                    custom_parameters=custom_parameters,
-                    call_sid=start_call_sid,
-                ),
-                {"event": "stop"},
-            ]
-        )
+        messages = [
+            start_message(
+                custom_parameters=custom_parameters,
+                call_sid=start_call_sid,
+            )
+        ]
+        if not disconnect_after_start:
+            messages.append({"event": "stop"})
+        websocket = FakeWebSocket(messages)
         client = object()
         stream = object()
 
@@ -482,8 +514,20 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             connected_websocket,
             stream_sid,
             session_stopping,
-            assistant_text_chunks,
+            transcript_buffer,
         ):
+            if transcript_text is not None:
+                transcript_buffer.start_content({
+                    "contentId": "user-1",
+                    "role": "USER",
+                    "type": "TEXT",
+                    "additionalModelFields": '{"generationStage":"FINAL"}',
+                })
+                transcript_buffer.add_text({
+                    "contentId": "user-1",
+                    "content": transcript_text,
+                })
+                transcript_buffer.end_content({"contentId": "user-1"})
             await session_stopping.wait()
 
         nova_stream_mock = AsyncMock(return_value=(client, stream, "prompt-1"))
@@ -492,6 +536,12 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         audio_content_mock = AsyncMock(return_value="audio-1")
         create_call_mock = Mock(
             side_effect=insert_error if insert_error else lambda call_data: {"id": "call-1"}
+        )
+        finalize_call_mock = Mock()
+        update_summary_mock = Mock(side_effect=summary_update_error)
+        summary_mock = AsyncMock(
+            side_effect=summary_error if summary_error else None,
+            return_value="Caller asked about the property.",
         )
 
         property_reader = Mock(
@@ -508,7 +558,9 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "read_phone_number_matches", return_value=matches),
             patch.object(main, "read_property_context", property_reader),
             patch.object(main, "create_call_record", create_call_mock),
-            patch.object(main, "finalize_call_record"),
+            patch.object(main, "finalize_call_record", finalize_call_mock),
+            patch.object(main, "update_call_summary", update_summary_mock),
+            patch.object(main, "generate_call_summary", summary_mock),
             patch.object(main, "create_nova_stream", nova_stream_mock),
             patch.object(main, "start_session", start_session_mock),
             patch.object(main, "send_system_prompt", system_prompt_mock),
@@ -519,6 +571,9 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         ):
             await main.twilio_media_stream(websocket)
 
+        self.finalize_call_mock = finalize_call_mock
+        self.update_summary_mock = update_summary_mock
+        self.summary_mock = summary_mock
         return websocket, create_call_mock, nova_stream_mock, system_prompt_mock, property_reader
 
     async def test_valid_mapping_persists_ids_and_caller_phone_then_starts_nova(self):
@@ -537,6 +592,85 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Spring campaign", system_prompt.await_args.args[2])
         self.assertIn("12 Main Street", system_prompt.await_args.args[2])
         self.assertTrue(websocket.accepted)
+
+    async def test_completed_call_persists_transcript_before_summary(self):
+        await self.run_stream(
+            [phone_record()],
+            property_context(),
+            transcript_text="Could I arrange a viewing?",
+        )
+
+        self.finalize_call_mock.assert_called_once()
+        stored_transcript = json.loads(
+            self.finalize_call_mock.call_args.args[1]["transcript"]
+        )
+        self.assertEqual(stored_transcript[0]["role"], "USER")
+        self.assertEqual(stored_transcript[0]["text"], "Could I arrange a viewing?")
+        self.assertTrue(stored_transcript[0]["timestamp"])
+        self.summary_mock.assert_awaited_once_with(stored_transcript)
+        self.update_summary_mock.assert_called_once_with(
+            "call-1",
+            "Caller asked about the property.",
+        )
+
+    async def test_summary_failure_does_not_prevent_transcript_finalization(self):
+        await self.run_stream(
+            [phone_record()],
+            property_context(),
+            transcript_text="I am comparing a few homes.",
+            summary_error=RuntimeError("summary unavailable"),
+        )
+
+        self.finalize_call_mock.assert_called_once()
+        stored_transcript = json.loads(
+            self.finalize_call_mock.call_args.args[1]["transcript"]
+        )
+        self.assertEqual(stored_transcript[0]["text"], "I am comparing a few homes.")
+        self.assertEqual(
+            self.finalize_call_mock.call_args.args[1]["status"],
+            "completed",
+        )
+        self.update_summary_mock.assert_not_called()
+
+    async def test_summary_persistence_failure_does_not_change_completed_call(self):
+        await self.run_stream(
+            [phone_record()],
+            property_context(),
+            transcript_text="I would like to see it.",
+            summary_update_error=RuntimeError("summary write unavailable"),
+        )
+
+        self.finalize_call_mock.assert_called_once()
+        self.assertEqual(
+            self.finalize_call_mock.call_args.args[1]["status"],
+            "completed",
+        )
+        self.summary_mock.assert_awaited_once()
+        self.update_summary_mock.assert_called_once()
+
+    async def test_unexpected_disconnect_persists_structured_transcript(self):
+        websocket, *_ = await self.run_stream(
+            [phone_record()],
+            property_context(),
+            transcript_text="Could you tell me about parking?",
+            disconnect_after_start=True,
+        )
+
+        self.assertEqual(websocket.close_codes, [])
+        self.finalize_call_mock.assert_called_once()
+        call_data = self.finalize_call_mock.call_args.args[1]
+        self.assertEqual(call_data["status"], "failed")
+        self.assertEqual(
+            json.loads(call_data["transcript"]),
+            [
+                {
+                    "role": "USER",
+                    "text": "Could you tell me about parking?",
+                    "timestamp": json.loads(call_data["transcript"])[0]["timestamp"],
+                }
+            ],
+        )
+        self.summary_mock.assert_not_awaited()
 
     async def test_anonymous_caller_is_persisted_as_null_and_starts_nova(self):
         parameters = signed_parameters(caller_number="anonymous")

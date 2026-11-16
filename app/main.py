@@ -13,7 +13,7 @@ from app.api import health, phone_numbers, twilio_webhooks
 app = FastAPI(title="AI House Agent Backend")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
+    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080","https://preview--simple-supabase-studio.lovable.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

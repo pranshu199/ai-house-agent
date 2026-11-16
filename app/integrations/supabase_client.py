@@ -180,3 +180,18 @@ def finalize_call_record(call_id: str, call_data: dict) -> None:
     )
     if not response.data:
         raise RuntimeError("Call finalization did not update a record")
+
+
+def update_call_summary(call_id: str, summary: str) -> None:
+    """Persist only the generated summary for an existing call."""
+
+    response = (
+        get_supabase_client()
+        .table("calls")
+        .update({"ai_summary": summary})
+        .eq("id", call_id)
+        .select("id")
+        .execute()
+    )
+    if not response.data:
+        raise RuntimeError("Call summary update did not update a record")
