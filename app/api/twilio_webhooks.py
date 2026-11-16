@@ -1165,9 +1165,10 @@ async def twilio_media_stream(websocket: WebSocket):
                         )
                     except Exception as exc:
                         logger.warning(
-                            "CALL_LEAD_CAPTURE_FAILURE call_id=%s error_type=%s",
+                            "CALL_LEAD_CAPTURE_FAILURE call_id=%s error_type=%s error=%s",
                             call_record_id,
                             type(exc).__name__,
+                            str(exc),
                         )
 
         if websocket_connected:
