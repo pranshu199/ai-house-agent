@@ -505,6 +505,34 @@ def _safe_supabase_error(
     return " ".join(diagnostic.split())[:800]
 
 
+def _safe_bedrock_error_message(exc: Exception) -> str:
+    """Return bounded AWS diagnostics without logging credential material."""
+
+    message = getattr(exc, "message", None)
+    if not isinstance(message, str) or not message:
+        return "message unavailable"
+
+    diagnostic = " ".join(message.split())
+    diagnostic = re.sub(
+        r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b",
+        "[REDACTED_AWS_KEY]",
+        diagnostic,
+    )
+    diagnostic = re.sub(
+        r"(?i)(\b(?:aws[_ -]?)?(?:secret[_ -]?access[_ -]?key|session[_ -]?token|"
+        r"access[_ -]?key[_ -]?id|auth[_ -]?token|api[_ -]?key|credential|password)"
+        r"\b['\"]?\s*[:=]\s*['\"]?)[^'\"\s,;}]+",
+        r"\1[REDACTED]",
+        diagnostic,
+    )
+    diagnostic = re.sub(
+        r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+",
+        "Bearer [REDACTED]",
+        diagnostic,
+    )
+    return diagnostic[:500]
+
+
 @router.api_route("/twilio/voice", methods=["GET", "POST"], response_class=Response)
 async def twilio_voice(request: Request):
     try:
@@ -1104,9 +1132,11 @@ async def twilio_media_stream(websocket: WebSocket):
                     )
                 except Exception as exc:
                     logger.warning(
-                        "CALL_SUMMARY_GENERATION_FAILURE call_id=%s error_type=%s",
+                        "CALL_SUMMARY_GENERATION_FAILURE call_id=%s "
+                        "error_type=%s aws_message=%s",
                         call_record_id,
                         type(exc).__name__,
+                        _safe_bedrock_error_message(exc),
                     )
 
         if websocket_connected:

@@ -25,7 +25,7 @@ from aws_sdk_bedrock_runtime.models import (
 
 
 MODEL_ID = "amazon.nova-2-sonic-v1:0"
-SUMMARY_MODEL_ID = "amazon.nova-2-lite-v1:0"
+SUMMARY_MODEL_ID = "us.amazon.nova-2-lite-v1:0"
 REGION = "us-east-1"
 
 SAMPLE_RATE = 24000

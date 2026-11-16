@@ -423,7 +423,7 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
                 "resolve",
                 new_callable=AsyncMock,
                 return_value=config,
-            ),
+            ) as resolve_config,
             patch.object(
                 nova_client,
                 "AsyncBedrockRuntimeClient",
@@ -435,7 +435,9 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary, "Caller Sam requested property details.")
         client.converse.assert_awaited_once()
         request = client.converse.await_args.args[0]
+        self.assertEqual(request.model_id, "us.amazon.nova-2-lite-v1:0")
         self.assertEqual(request.model_id, nova_client.SUMMARY_MODEL_ID)
+        self.assertEqual(resolve_config.await_args.kwargs["region"], "us-east-1")
         self.assertIn("only facts explicitly", request.system[0].value)
         self.assertIn('"My name is Sam."', request.messages[0].content[0].value)
         client.close.assert_awaited_once()

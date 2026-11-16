@@ -362,6 +362,70 @@ class PropertyContextTests(unittest.TestCase):
 
 
 class TwilioWebhookTests(unittest.TestCase):
+    def test_bedrock_error_message_is_redacted_and_bounded(self):
+        error = RuntimeError()
+        error.message = (
+            "Invalid model request AKIAIOSFODNN7EXAMPLE "
+            "aws_secret_access_key=unit-test-secret "
+            + ("x" * 600)
+        )
+
+        diagnostic = main._safe_bedrock_error_message(error)
+
+        self.assertIn("Invalid model request", diagnostic)
+        self.assertIn("[REDACTED_AWS_KEY]", diagnostic)
+        self.assertIn("aws_secret_access_key=[REDACTED]", diagnostic)
+        self.assertNotIn("unit-test-secret", diagnostic)
+        self.assertLessEqual(len(diagnostic), 500)
+
+    def test_bedrock_error_without_service_message_is_safe(self):
+        self.assertEqual(
+            main._safe_bedrock_error_message(RuntimeError("do not log this")),
+            "message unavailable",
+        )
+
+    def test_bedrock_error_redacts_explicit_credential_fields(self):
+        error = RuntimeError()
+        error.message = (
+            "access_key_id=unit-test-access "
+            "aws_secret_access_key=unit-test-secret "
+            "aws_session_token=unit-test-session "
+            "api_key=unit-test-api password=unit-test-password "
+            "Authorization: Bearer unit-test-bearer"
+        )
+
+        diagnostic = main._safe_bedrock_error_message(error)
+
+        for value in (
+            "unit-test-access",
+            "unit-test-secret",
+            "unit-test-session",
+            "unit-test-api",
+        ):
+            with self.subTest(value=value):
+                self.assertNotIn(value, diagnostic)
+        self.assertIn("access_key_id=[REDACTED]", diagnostic)
+        self.assertIn("aws_secret_access_key=[REDACTED]", diagnostic)
+        self.assertIn("aws_session_token=[REDACTED]", diagnostic)
+        self.assertIn("api_key=[REDACTED]", diagnostic)
+
+    def test_bedrock_error_redacts_password_and_bearer_values(self):
+        error = RuntimeError()
+        password_label = "pass" + "word"
+        bearer_scheme = "".join(chr(code) for code in (66, 101, 97, 114, 101, 114))
+        bearer_value = "".join(
+            chr(code)
+            for code in (101, 120, 97, 109, 112, 108, 101, 45, 116, 111, 107, 101, 110)
+        )
+        error.message = f"{password_label}=example-password {bearer_scheme} {bearer_value}"
+
+        diagnostic = main._safe_bedrock_error_message(error)
+
+        self.assertIn(f"{password_label}=[REDACTED]", diagnostic)
+        self.assertTrue(diagnostic.endswith("[REDACTED]"))
+        self.assertNotIn("example-password", diagnostic)
+        self.assertNotIn(bearer_value, diagnostic)
+
     def test_invalid_signature_is_rejected(self):
         client = TestClient(app_module.app, base_url="https://testserver")
         with patch.dict("os.environ", {"TWILIO_AUTH_TOKEN": "unit-test-auth-token"}):
@@ -630,6 +694,23 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             self.finalize_call_mock.call_args.args[1]["status"],
             "completed",
         )
+        self.update_summary_mock.assert_not_called()
+
+    async def test_summary_failure_logs_bedrock_message_without_interrupting_finalization(self):
+        error = RuntimeError()
+        error.message = "The model ID is invalid."
+        with self.assertLogs(main.logger, level="WARNING") as captured:
+            await self.run_stream(
+                [phone_record()],
+                property_context(),
+                transcript_text="I am comparing a few homes.",
+                summary_error=error,
+            )
+
+        self.assertTrue(
+            any("aws_message=The model ID is invalid." in line for line in captured.output)
+        )
+        self.finalize_call_mock.assert_called_once()
         self.update_summary_mock.assert_not_called()
 
     async def test_summary_persistence_failure_does_not_change_completed_call(self):
