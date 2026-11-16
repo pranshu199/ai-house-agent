@@ -9,6 +9,7 @@ from aws_sdk_bedrock_runtime.models import (
     ConverseOutputMessage,
     ConversationRole,
     Message,
+    StopReason,
 )
 
 from app.integrations import nova_client
@@ -471,7 +472,13 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         client.close.assert_awaited_once()
         http_client.close.assert_not_awaited()
 
-    async def _extract_lead_response(self, response_text):
+    async def _extract_lead_response(
+        self,
+        response_text,
+        *,
+        stop_reason=StopReason.END_TURN,
+        usage=(100, 50, 150),
+    ):
         response = type(
             "ConverseResponse",
             (),
@@ -481,7 +488,17 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
                         role=ConversationRole.ASSISTANT,
                         content=[ContentBlockText(value=response_text)],
                     )
-                )
+                ),
+                "stop_reason": stop_reason,
+                "usage": type(
+                    "Usage",
+                    (),
+                    {
+                        "input_tokens": usage[0],
+                        "output_tokens": usage[1],
+                        "total_tokens": usage[2],
+                    },
+                )(),
             },
         )()
         http_client = AsyncMock()
@@ -506,6 +523,9 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.model_id, "us.amazon.nova-2-lite-v1:0")
         self.assertEqual(resolve_config.await_args.kwargs["region"], "us-east-1")
         self.assertIn("only use user messages", request.system[0].value.lower())
+        self.assertIn("no Markdown fences", request.system[0].value)
+        self.assertEqual(request.inference_config.max_tokens, 900)
+        self.assertEqual(request.inference_config.temperature, 0.1)
         client.close.assert_awaited_once()
         return result
 
@@ -531,6 +551,20 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(extraction["budget_max"], 650000)
         self.assertEqual(extraction["evidence"], ["Caller asked to view the house."])
 
+    async def test_extract_call_lead_accepts_json_in_markdown_fence(self):
+        response_text = json.dumps(self._valid_lead())
+        extraction = await self._extract_lead_response(
+            f"```json\n{response_text}\n```"
+        )
+        self.assertEqual(extraction["intent"], "viewing_request")
+
+    async def test_extract_call_lead_accepts_json_with_explanatory_text(self):
+        response_text = json.dumps(self._valid_lead())
+        extraction = await self._extract_lead_response(
+            f"Here is the requested extraction:\n{response_text}\nEnd of response."
+        )
+        self.assertEqual(extraction["lead_type"], "buyer")
+
     async def test_extract_call_lead_accepts_undisclosed_caller_information(self):
         extraction = await self._extract_lead_response(
             json.dumps(
@@ -552,9 +586,84 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(extraction["email"])
         self.assertEqual(extraction["lead_type"], "unknown")
 
-    async def test_extract_call_lead_rejects_malformed_json(self):
+    async def test_extract_call_lead_reports_max_tokens_truncation_metadata(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"truncated at max_tokens; stop_reason=max_tokens "
+            r"input_tokens=1250 output_tokens=500 total_tokens=1750",
+        ):
+            await self._extract_lead_response(
+                '{"name":"Sam",',
+                stop_reason=StopReason.MAX_TOKENS,
+                usage=(1250, 500, 1750),
+            )
+
+    async def test_extract_call_lead_reports_malformed_json_metadata(self):
+        with self.assertRaisesRegex(
+            ValueError,
+            r"malformed JSON; stop_reason=end_turn "
+            r"input_tokens=1250 output_tokens=75 total_tokens=1325",
+        ) as raised:
+            await self._extract_lead_response(
+                '{"name": }',
+                usage=(1250, 75, 1325),
+            )
+        self.assertNotIn('{"name": }', str(raised.exception))
+
+    async def test_extract_call_lead_does_not_salvage_json_after_incomplete_object(self):
+        complete_object = json.dumps(self._valid_lead())
         with self.assertRaisesRegex(ValueError, "malformed JSON"):
-            await self._extract_lead_response("not json")
+            await self._extract_lead_response(
+                '{"incomplete": ' + complete_object
+            )
+
+    async def test_extract_call_lead_rejects_missing_json(self):
+        with self.assertRaisesRegex(ValueError, "response is missing JSON"):
+            await self._extract_lead_response("The caller did not disclose details.")
+
+    async def test_extract_call_lead_rejects_multiple_json_objects(self):
+        first = json.dumps(self._valid_lead())
+        second = json.dumps(self._valid_lead(intent="buying"))
+        with self.assertRaisesRegex(ValueError, "multiple JSON objects"):
+            await self._extract_lead_response(f"{first}\n{second}")
+
+    async def test_extract_call_lead_rejects_duplicate_json_fields(self):
+        response_text = json.dumps(self._valid_lead())
+        response_text = response_text.replace(
+            '"name": "Sam"',
+            '"name": "Sam", "name": "Different value"',
+        )
+        with self.assertRaisesRegex(ValueError, "malformed JSON"):
+            await self._extract_lead_response(response_text)
+
+    async def test_extract_call_lead_rejects_non_object_json(self):
+        with self.assertRaisesRegex(ValueError, "JSON must be an object"):
+            await self._extract_lead_response(f"[{json.dumps(self._valid_lead())}]")
+
+    async def test_extract_call_lead_rejects_unexpected_response_structure(self):
+        response = type(
+            "ConverseResponse",
+            (),
+            {
+                "output": None,
+                "stop_reason": StopReason.END_TURN,
+                "usage": type(
+                    "Usage",
+                    (),
+                    {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "total_tokens": 15,
+                    },
+                )(),
+            },
+        )()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"unexpected structure; stop_reason=end_turn "
+            r"input_tokens=10 output_tokens=5 total_tokens=15",
+        ):
+            nova_client._parse_call_lead_response(response)
 
     async def test_extract_call_lead_rejects_invalid_fields(self):
         response = {
@@ -571,6 +680,54 @@ class NovaCRTWriterTaskTests(unittest.IsolatedAsyncioTestCase):
         }
         with self.assertRaisesRegex(ValueError, "intent is invalid"):
             await self._extract_lead_response(json.dumps(response))
+
+    async def test_extract_call_lead_rejects_invalid_field_types(self):
+        for overrides, expected_error in (
+            ({"name": 17}, "field name must be text or null"),
+            ({"intent": []}, "intent is invalid"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    await self._extract_lead_response(
+                        json.dumps(self._valid_lead(**overrides))
+                    )
+
+    async def test_extract_call_lead_rejects_unexpected_fields(self):
+        response = self._valid_lead()
+        response["phone"] = "+14165550199"
+        with self.assertRaisesRegex(ValueError, "unexpected JSON shape"):
+            await self._extract_lead_response(json.dumps(response))
+
+    async def test_extract_call_lead_preserves_strict_field_validation(self):
+        for overrides, expected_error in (
+            ({"lead_type": "investor"}, "lead_type is invalid"),
+            ({"budget_min": True}, "budget_min must be a non-negative number"),
+            ({"budget_min": 700, "budget_max": 600}, "budget_min exceeds budget_max"),
+            ({"evidence": [""]}, "evidence must be a list"),
+            ({"summary": "  "}, "summary is required"),
+        ):
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, expected_error):
+                    await self._extract_lead_response(
+                        json.dumps(self._valid_lead(**overrides))
+                    )
+
+    @staticmethod
+    def _valid_lead(**overrides):
+        response = {
+            "name": "Sam",
+            "email": "sam@example.test",
+            "lead_type": "buyer",
+            "intent": "viewing_request",
+            "budget_min": 500000,
+            "budget_max": 650000,
+            "timeline": "within 2 weeks",
+            "interested_property": "12 Main Street",
+            "summary": "Caller requested a viewing of 12 Main Street.",
+            "evidence": ["Caller asked to view the house."],
+        }
+        response.update(overrides)
+        return response
 
     @staticmethod
     async def _raise(error):

@@ -21,6 +21,7 @@ from aws_sdk_bedrock_runtime.models import (
     InvokeModelWithBidirectionalStreamInputChunk,
     BidirectionalInputPayloadPart,
     Message,
+    StopReason,
     SystemContentBlockText,
 )
 
@@ -296,18 +297,132 @@ async def generate_call_summary(transcript: list[dict[str, str]]) -> str:
             await http_client.close()
 
 
+def _call_lead_response_metadata(response) -> str:
+    stop_reason = getattr(response, "stop_reason", None)
+    if hasattr(stop_reason, "value"):
+        stop_reason = stop_reason.value
+    valid_stop_reasons = {reason.value for reason in StopReason}
+    if stop_reason not in valid_stop_reasons:
+        stop_reason = "unknown"
+
+    usage = getattr(response, "usage", None)
+    token_counts = []
+    for field in ("input_tokens", "output_tokens", "total_tokens"):
+        value = getattr(usage, field, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            token_counts.append(f"{field}={value}")
+        else:
+            token_counts.append(f"{field}=unknown")
+    return f"stop_reason={stop_reason} " + " ".join(token_counts)
+
+
+class _DuplicateCallLeadJSONKey(ValueError):
+    pass
+
+
+def _unique_json_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise _DuplicateCallLeadJSONKey
+        result[key] = value
+    return result
+
+
+def _extract_call_lead_json(response_text: str, response) -> dict:
+    decoder = json.JSONDecoder(object_pairs_hook=_unique_json_object)
+    objects = []
+    found_non_object_json = False
+    found_malformed_object = False
+    position = 0
+
+    while position < len(response_text):
+        start = min(
+            (
+                index
+                for index in (
+                    response_text.find("{", position),
+                    response_text.find("[", position),
+                )
+                if index >= 0
+            ),
+            default=-1,
+        )
+        if start < 0:
+            break
+        try:
+            value, end = decoder.raw_decode(response_text, start)
+        except (json.JSONDecodeError, _DuplicateCallLeadJSONKey):
+            if response_text[start] == "{":
+                found_malformed_object = True
+            position = start + 1
+            continue
+
+        if isinstance(value, dict):
+            objects.append(value)
+        else:
+            found_non_object_json = True
+        position = end
+
+    metadata = _call_lead_response_metadata(response)
+    stop_reason = getattr(response, "stop_reason", None)
+    if hasattr(stop_reason, "value"):
+        stop_reason = stop_reason.value
+    has_parse_failure = (
+        found_malformed_object
+        or len(objects) > 1
+        or found_non_object_json
+        or not objects
+    )
+    if has_parse_failure and stop_reason == StopReason.MAX_TOKENS.value:
+        raise ValueError(
+            "Nova lead extraction response may be truncated at max_tokens; "
+            f"{metadata}"
+        )
+    if found_malformed_object:
+        raise ValueError(
+            f"Nova lead extraction returned malformed JSON; {metadata}"
+        )
+    if len(objects) > 1:
+        raise ValueError(
+            f"Nova lead extraction returned multiple JSON objects; {metadata}"
+        )
+    if found_non_object_json:
+        raise ValueError(
+            f"Nova lead extraction JSON must be an object; {metadata}"
+        )
+    if not objects:
+        raise ValueError(f"Nova lead extraction response is missing JSON; {metadata}")
+    return objects[0]
+
+
 def _parse_call_lead_response(response) -> dict:
-    if not isinstance(response.output, ConverseOutputMessage):
-        raise RuntimeError("Nova lead extraction response did not contain a message")
+    metadata = _call_lead_response_metadata(response)
+    output = getattr(response, "output", None)
+    if not isinstance(output, ConverseOutputMessage):
+        raise RuntimeError(
+            "Nova lead extraction response had an unexpected structure; "
+            f"{metadata}"
+        )
+    content = getattr(getattr(output, "value", None), "content", None)
+    if not isinstance(content, list):
+        raise RuntimeError(
+            "Nova lead extraction response had an unexpected structure; "
+            f"{metadata}"
+        )
+    text_blocks = [
+        block for block in content if isinstance(block, ContentBlockText)
+    ]
+    if any(not isinstance(block.value, str) for block in text_blocks):
+        raise RuntimeError(
+            "Nova lead extraction response had an unexpected structure; "
+            f"{metadata}"
+        )
     response_text = "".join(
         block.value
-        for block in response.output.value.content
-        if isinstance(block, ContentBlockText)
+        for block in text_blocks
     ).strip()
-    try:
-        lead = json.loads(response_text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("Nova lead extraction returned malformed JSON") from exc
+    lead = _extract_call_lead_json(response_text, response)
 
     if not isinstance(lead, dict):
         raise ValueError("Nova lead extraction must return a JSON object")
@@ -357,7 +472,7 @@ def _parse_call_lead_response(response) -> dict:
 
     for field, values in allowed_values.items():
         value = lead.get(field)
-        if value not in values:
+        if not isinstance(value, str) or value not in values:
             raise ValueError(f"Nova lead extraction field {field} is invalid")
         validated[field] = value
 
@@ -423,7 +538,9 @@ async def extract_call_lead(transcript: list[dict[str, str]]) -> dict:
                             "financing_question, general_inquiry, or unknown), budget_min "
                             "(number or null), budget_max (number or null), timeline (string "
                             "or null), interested_property (string or null), summary (short "
-                            "factual string), evidence (array of short caller-supported facts)."
+                            "factual string), evidence (array of short caller-supported facts). "
+                            "Use exactly these keys and JSON types. Emit one complete JSON "
+                            "object with no Markdown fences or explanatory text."
                         )
                     )
                 ],
@@ -443,7 +560,7 @@ async def extract_call_lead(transcript: list[dict[str, str]]) -> dict:
                     )
                 ],
                 inference_config=InferenceConfiguration(
-                    max_tokens=500,
+                    max_tokens=900,
                     temperature=0.1,
                 ),
             )
