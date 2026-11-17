@@ -1,12 +1,16 @@
 """Lead extraction scoring and Supabase persistence."""
 
 import asyncio
+import logging
 import re
 
+from app.integrations import supabase_client
 from app.integrations.nova_client import extract_call_lead
 from app.integrations.supabase_client import persist_call_lead
+from app.services.notifications import enqueue_lead_notifications
 
 
+logger = logging.getLogger(__name__)
 _DAYS_PATTERN = re.compile(r"\b(?:within|in)\s+(\d+)\s+days?\b", re.IGNORECASE)
 _WEEKS_PATTERN = re.compile(r"\b(?:within|in)\s+(\d+)\s+weeks?\b", re.IGNORECASE)
 
@@ -78,10 +82,30 @@ async def capture_call_lead(
 
     extraction = await extract_call_lead(transcript)
     score, priority = score_lead(extraction, transcript)
-    return await asyncio.to_thread(
+    lead_id = await asyncio.to_thread(
         persist_call_lead,
         call_id,
         extraction,
         score,
         priority,
     )
+    try:
+        attribution = await asyncio.to_thread(
+            supabase_client.read_call_notification_attribution,
+            call_id,
+        )
+        await asyncio.to_thread(
+            enqueue_lead_notifications,
+            call_id,
+            lead_id,
+            attribution["realtor_id"],
+            attribution["property_id"],
+            extraction["intent"],
+        )
+    except Exception as exc:
+        logger.warning(
+            "LEAD_NOTIFICATION_ENQUEUE_FAILURE call_id=%s error_type=%s",
+            call_id,
+            type(exc).__name__,
+        )
+    return lead_id

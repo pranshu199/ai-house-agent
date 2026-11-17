@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import uuid
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 
 from supabase import Client, create_client
@@ -197,6 +198,271 @@ def update_call_summary(call_id: str, summary: str) -> None:
     )
     if not response.data:
         raise RuntimeError("Call summary update did not update a record")
+
+
+NOTIFICATION_PREFERENCE_FIELDS = (
+    "sms_enabled",
+    "email_enabled",
+    "sms_incoming_calls",
+    "sms_new_leads",
+    "sms_viewing_requests",
+    "email_new_leads",
+    "email_viewing_requests",
+)
+
+DEFAULT_NOTIFICATION_PREFERENCES = {
+    "sms_enabled": True,
+    "email_enabled": True,
+    "sms_incoming_calls": True,
+    "sms_new_leads": True,
+    "sms_viewing_requests": True,
+    "email_new_leads": True,
+    "email_viewing_requests": True,
+}
+
+
+def read_notification_preferences(realtor_id: str) -> dict:
+    """Read one realtor's preferences, applying the migration defaults if absent."""
+
+    realtor_id = _validate_database_uuid(realtor_id, "realtor_id")
+    response = (
+        get_supabase_client()
+        .table("notification_preferences")
+        .select(",".join(NOTIFICATION_PREFERENCE_FIELDS))
+        .eq("realtor_id", realtor_id)
+        .limit(1)
+        .execute()
+    )
+    records = response.data or []
+    if not records:
+        return dict(DEFAULT_NOTIFICATION_PREFERENCES)
+    return {
+        field: records[0].get(field, DEFAULT_NOTIFICATION_PREFERENCES[field])
+        for field in NOTIFICATION_PREFERENCE_FIELDS
+    }
+
+
+def save_notification_preferences(realtor_id: str, updates: dict) -> dict:
+    """Persist only supported notification preferences for the authenticated realtor."""
+
+    realtor_id = _validate_database_uuid(realtor_id, "realtor_id")
+    if not updates or set(updates) - set(NOTIFICATION_PREFERENCE_FIELDS):
+        raise ValueError("Notification preferences contain unsupported fields")
+    if any(not isinstance(value, bool) for value in updates.values()):
+        raise ValueError("Notification preference values must be boolean")
+
+    response = (
+        get_supabase_client()
+        .table("notification_preferences")
+        .upsert(
+            {
+                "realtor_id": realtor_id,
+                **updates,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            on_conflict="realtor_id",
+        )
+        .select(",".join(NOTIFICATION_PREFERENCE_FIELDS))
+        .execute()
+    )
+    records = response.data or []
+    if not records:
+        raise RuntimeError("Notification preference update did not return a record")
+    return {
+        field: records[0].get(field, DEFAULT_NOTIFICATION_PREFERENCES[field])
+        for field in NOTIFICATION_PREFERENCE_FIELDS
+    }
+
+
+def create_notification_delivery(delivery: dict) -> bool:
+    """Insert a delivery once; return False only for its idempotency conflict."""
+
+    try:
+        response = (
+            get_supabase_client()
+            .table("notification_deliveries")
+            .insert(delivery)
+            .select("id")
+            .execute()
+        )
+    except Exception as exc:
+        if getattr(exc, "code", None) == "23505":
+            return False
+        raise
+    if not response.data or not response.data[0].get("id"):
+        raise RuntimeError("Notification delivery insert did not return an ID")
+    return True
+
+
+def read_due_notification_deliveries(limit: int = 20) -> list[dict]:
+    """Read pending and abandoned in-flight deliveries eligible for processing."""
+
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("Notification delivery limit must be from 1 to 100")
+
+    client = get_supabase_client()
+    now = datetime.now(timezone.utc)
+    pending = (
+        client.table("notification_deliveries")
+        .select(
+            "id,realtor_id,property_id,call_id,lead_id,appointment_id,event_type,"
+            "channel,delivery_status,idempotency_key,retry_count,updated_at"
+        )
+        .eq("delivery_status", "pending")
+        .lte("next_attempt_at", now.isoformat())
+        .order("created_at")
+        .limit(limit)
+        .execute()
+    )
+    stale_before = (now - timedelta(minutes=5)).isoformat()
+    abandoned = (
+        client.table("notification_deliveries")
+        .select(
+            "id,realtor_id,property_id,call_id,lead_id,appointment_id,event_type,"
+            "channel,delivery_status,idempotency_key,retry_count,updated_at"
+        )
+        .eq("delivery_status", "sending")
+        .lt("updated_at", stale_before)
+        .order("updated_at")
+        .limit(limit)
+        .execute()
+    )
+    deliveries = (pending.data or []) + (abandoned.data or [])
+    unique_deliveries = {item["id"]: item for item in deliveries if item.get("id")}
+    return list(unique_deliveries.values())[:limit]
+
+
+def claim_notification_delivery(delivery: dict) -> dict | None:
+    """Atomically claim an eligible delivery using its observed status and timestamp."""
+
+    delivery_id = _validate_database_uuid(delivery.get("id"), "delivery_id")
+    status = delivery.get("delivery_status")
+    if status not in {"pending", "sending"}:
+        return None
+
+    now = datetime.now(timezone.utc).isoformat()
+    query = (
+        get_supabase_client()
+        .table("notification_deliveries")
+        .update(
+            {
+                "delivery_status": "sending",
+                "updated_at": now,
+            }
+        )
+        .eq("id", delivery_id)
+        .eq("delivery_status", status)
+    )
+    observed_updated_at = delivery.get("updated_at")
+    if isinstance(observed_updated_at, str):
+        query = query.eq("updated_at", observed_updated_at)
+    if status == "pending":
+        query = query.lte("next_attempt_at", now)
+    response = query.select(
+        "id,realtor_id,property_id,call_id,lead_id,appointment_id,event_type,"
+        "channel,delivery_status,idempotency_key,retry_count,updated_at"
+    ).execute()
+    records = response.data or []
+    return records[0] if records else None
+
+
+def read_notification_delivery_context(delivery: dict) -> dict:
+    """Read only the realtor and call/lead/property fields used in a notification."""
+
+    client = get_supabase_client()
+    realtor_id = _validate_database_uuid(delivery.get("realtor_id"), "realtor_id")
+    realtor_response = (
+        client.table("realtors")
+        .select("name,email,phone")
+        .eq("id", realtor_id)
+        .limit(1)
+        .execute()
+    )
+    realtors = realtor_response.data or []
+    if not realtors:
+        raise RuntimeError("Notification realtor was not found")
+
+    context = {"realtor": realtors[0], "property": {}, "call": {}, "lead": {}}
+    for field, table_name, select_fields, target in (
+        (
+            "property_id",
+            "properties",
+            "address,city",
+            "property",
+        ),
+        (
+            "call_id",
+            "calls",
+            "caller_phone,ai_summary",
+            "call",
+        ),
+        (
+            "lead_id",
+            "leads",
+            "name,email,phone,summary,intent,timeline,budget_min,budget_max",
+            "lead",
+        ),
+    ):
+        record_id = delivery.get(field)
+        if record_id is None:
+            continue
+        record_id = _validate_database_uuid(record_id, field)
+        response = (
+            client.table(table_name)
+            .select(select_fields)
+            .eq("id", record_id)
+            .limit(1)
+            .execute()
+        )
+        records = response.data or []
+        if records:
+            context[target] = records[0]
+    return context
+
+
+def read_call_notification_attribution(call_id: str) -> dict:
+    """Read notification attribution from a persisted call after lead linking."""
+
+    call_id = _validate_database_uuid(call_id, "call_id")
+    response = (
+        get_supabase_client()
+        .table("calls")
+        .select("realtor_id,property_id")
+        .eq("id", call_id)
+        .limit(1)
+        .execute()
+    )
+    records = response.data or []
+    if not records:
+        raise RuntimeError("Persisted call was not found for notification enqueue")
+    realtor_id = _validate_database_uuid(records[0].get("realtor_id"), "realtor_id")
+    property_id = _validate_database_uuid(
+        records[0].get("property_id"),
+        "property_id",
+        optional=True,
+    )
+    return {"realtor_id": realtor_id, "property_id": property_id}
+
+
+def update_notification_delivery(delivery_id: str, updates: dict) -> bool:
+    """Update an in-flight delivery without changing unrelated notification data."""
+
+    delivery_id = _validate_database_uuid(delivery_id, "delivery_id")
+    response = (
+        get_supabase_client()
+        .table("notification_deliveries")
+        .update(
+            {
+                **updates,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        .eq("id", delivery_id)
+        .eq("delivery_status", "sending")
+        .select("id")
+        .execute()
+    )
+    return bool(response.data)
 
 
 _E164_PHONE_PATTERN = re.compile(r"\+[1-9][0-9]{7,14}")

@@ -47,6 +47,7 @@ from app.integrations.supabase_client import (
     read_phone_number_matches,
 )
 from app.services.lead_capture import capture_call_lead
+from app.services.notifications import enqueue_incoming_call_started
 
 
 router = APIRouter()
@@ -874,6 +875,21 @@ async def twilio_media_stream(websocket: WebSocket):
                         )
                         await reject_call_start("call record creation failed", 1011)
                         break
+
+                    try:
+                        await asyncio.to_thread(
+                            enqueue_incoming_call_started,
+                            call_record_id,
+                            realtor_id,
+                            property_id,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "CALL_START_NOTIFICATION_ENQUEUE_FAILURE call_id=%s "
+                            "error_type=%s",
+                            call_record_id,
+                            type(exc).__name__,
+                        )
 
                 property_fields = (
                     ("address", "address"),

@@ -561,6 +561,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         summary_error=None,
         summary_update_error=None,
         lead_capture_error=None,
+        notification_error=None,
     ):
         messages = [
             start_message(
@@ -612,6 +613,10 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             side_effect=lead_capture_error if lead_capture_error else None,
             return_value="lead-1",
         )
+        notification_enqueue_mock = Mock(
+            side_effect=notification_error if notification_error else None,
+            return_value=1,
+        )
 
         property_reader = Mock(
             side_effect=context_error if context_error else lambda *_args: context
@@ -631,6 +636,11 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             patch.object(main, "update_call_summary", update_summary_mock),
             patch.object(main, "generate_call_summary", summary_mock),
             patch.object(main, "capture_call_lead", lead_capture_mock),
+            patch.object(
+                main,
+                "enqueue_incoming_call_started",
+                notification_enqueue_mock,
+            ),
             patch.object(main, "create_nova_stream", nova_stream_mock),
             patch.object(main, "start_session", start_session_mock),
             patch.object(main, "send_system_prompt", system_prompt_mock),
@@ -645,6 +655,7 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
         self.update_summary_mock = update_summary_mock
         self.summary_mock = summary_mock
         self.lead_capture_mock = lead_capture_mock
+        self.notification_enqueue_mock = notification_enqueue_mock
         return websocket, create_call_mock, nova_stream_mock, system_prompt_mock, property_reader
 
     async def test_valid_mapping_persists_ids_and_caller_phone_then_starts_nova(self):
@@ -698,6 +709,23 @@ class WebSocketAttributionTests(unittest.IsolatedAsyncioTestCase):
             self.finalize_call_mock.call_args.args[1]["transcript"]
         )
         self.assertEqual(stored_transcript[0]["text"], "I am comparing a few homes.")
+
+    async def test_notification_enqueue_failure_does_not_interrupt_call(self):
+        context = property_context()
+        websocket, create_call, nova_stream, _, _ = await self.run_stream(
+            [phone_record()],
+            context,
+            notification_error=RuntimeError("notification queue unavailable"),
+        )
+
+        self.notification_enqueue_mock.assert_called_once_with(
+            "call-1",
+            REALTOR_ID,
+            PROPERTY_ID,
+        )
+        create_call.assert_called_once()
+        nova_stream.assert_awaited_once()
+        self.assertTrue(websocket.accepted)
         self.assertEqual(
             self.finalize_call_mock.call_args.args[1]["status"],
             "completed",
