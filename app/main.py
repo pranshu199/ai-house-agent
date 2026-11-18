@@ -10,7 +10,7 @@ load_dotenv()
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import health, notifications, phone_numbers, twilio_webhooks
+from app.api import health, notifications, phone_numbers, property_images, twilio_webhooks
 from app.services.notifications import run_notification_worker
 
 
@@ -37,4 +37,5 @@ app.add_middleware(
 app.include_router(health.router)
 app.include_router(notifications.router)
 app.include_router(phone_numbers.router)
+app.include_router(property_images.router)
 app.include_router(twilio_webhooks.router)
