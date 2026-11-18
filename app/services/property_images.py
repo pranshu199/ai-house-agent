@@ -471,11 +471,25 @@ def get_image_signed_url(storage_path: str) -> str:
     """
     try:
         supabase = get_supabase_client()
-        url = supabase.storage.from_(STORAGE_BUCKET_NAME).create_signed_url(
+        response = supabase.storage.from_(STORAGE_BUCKET_NAME).create_signed_url(
             storage_path,
             SIGNED_URL_EXPIRY_SECONDS,
         )
-        return url
+
+        # First check whether the response is a dictionary
+        if not isinstance(response, dict):
+            raise StorageError("Invalid response from storage service")
+
+        # Then extract signedURL
+        signed_url = response.get("signedURL")
+        # If the key is missing, the value is empty, or the value isn't a string
+        if not signed_url or not isinstance(signed_url, str):
+            raise StorageError("Missing or invalid signedURL in storage response")
+
+        # Return the valid signed URL string
+        return signed_url
+    except StorageError:
+        raise
     except Exception as exc:
         logger.warning(
             "Failed to create signed URL: %s",

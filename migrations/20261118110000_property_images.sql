@@ -4,13 +4,16 @@
 
 BEGIN;
 
+-- Add unique constraint on (id, realtor_id) to properties table
+-- This enables composite foreign key from property_images
+ALTER TABLE public.properties
+    ADD CONSTRAINT properties_id_realtor_id_key UNIQUE (id, realtor_id);
+
 -- Create the property_images table
 CREATE TABLE public.property_images (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    property_id UUID NOT NULL
-        REFERENCES public.properties(id) ON DELETE CASCADE,
-    realtor_id UUID NOT NULL
-        REFERENCES public.realtors(id) ON DELETE CASCADE,
+    property_id UUID NOT NULL,
+    realtor_id UUID NOT NULL,
     storage_path TEXT NOT NULL
         UNIQUE
         CHECK (
@@ -22,12 +25,12 @@ CREATE TABLE public.property_images (
         CHECK (sort_order >= 0),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT property_images_property_realtor_match
-        CHECK (
-            (property_id, realtor_id) IN (
-                SELECT id, realtor_id FROM public.properties WHERE realtor_id = property_images.realtor_id
-            )
-        )
+    FOREIGN KEY (property_id, realtor_id)
+        REFERENCES public.properties (id, realtor_id)
+        ON DELETE CASCADE,
+    FOREIGN KEY (realtor_id)
+        REFERENCES public.realtors (id)
+        ON DELETE CASCADE
 );
 
 -- Unique partial index: at most one primary image per property

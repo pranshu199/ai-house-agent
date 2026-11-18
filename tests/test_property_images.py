@@ -371,17 +371,47 @@ class TestGetImageSignedUrl:
 
     @patch("app.services.property_images.get_supabase_client")
     def test_successful_signed_url(self, mock_get_client):
-        """Should generate signed URL."""
+        """Should generate signed URL from response dict."""
         mock_client = MagicMock()
         mock_get_client.return_value = mock_client
 
         expected_url = "https://example.com/signed?token=abc123"
         mock_storage = MagicMock()
-        mock_storage.create_signed_url.return_value = expected_url
+        mock_storage.create_signed_url.return_value = {
+            "signedURL": expected_url,
+            "signedUrl": expected_url,
+        }
         mock_client.storage.from_.return_value = mock_storage
 
         url = get_image_signed_url("path/to/image.jpg")
         assert url == expected_url
+        assert isinstance(url, str)
+
+    @patch("app.services.property_images.get_supabase_client")
+    def test_missing_signed_url(self, mock_get_client):
+        """Missing signedURL should raise StorageError."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_storage = MagicMock()
+        mock_storage.create_signed_url.return_value = {}
+        mock_client.storage.from_.return_value = mock_storage
+
+        with pytest.raises(StorageError, match="Missing or invalid signedURL"):
+            get_image_signed_url("path/to/image.jpg")
+
+    @patch("app.services.property_images.get_supabase_client")
+    def test_empty_signed_url(self, mock_get_client):
+        """Empty signedURL should raise StorageError."""
+        mock_client = MagicMock()
+        mock_get_client.return_value = mock_client
+
+        mock_storage = MagicMock()
+        mock_storage.create_signed_url.return_value = {"signedURL": ""}
+        mock_client.storage.from_.return_value = mock_storage
+
+        with pytest.raises(StorageError, match="Missing or invalid signedURL"):
+            get_image_signed_url("path/to/image.jpg")
 
     @patch("app.services.property_images.get_supabase_client")
     def test_signed_url_error(self, mock_get_client):
